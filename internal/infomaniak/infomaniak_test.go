@@ -324,3 +324,92 @@ func TestHelperFunctions(t *testing.T) {
 		assert.Equal(t, "sub.domain", extractRecordSource("sub.domain.example.com", "example.com"))
 	})
 }
+
+func TestNormalizeReadTarget(t *testing.T) {
+	tests := []struct {
+		name       string
+		recordType string
+		target     string
+		want       string
+	}{
+		{"SRV without trailing dot gets one", "SRV", "10 50 3478 turn.example.com", "10 50 3478 turn.example.com."},
+		{"SRV already dotted is unchanged", "SRV", "10 50 3478 turn.example.com.", "10 50 3478 turn.example.com."},
+		{"SRV malformed is left alone", "SRV", "not-an-srv", "not-an-srv"},
+		{"TXT surrounding quotes stripped", "TXT", "\"v=DMARC1; p=quarantine\"", "v=DMARC1; p=quarantine"},
+		{"TXT without quotes is unchanged", "TXT", "v=spf1 -all", "v=spf1 -all"},
+		{"TXT lone quote is left alone", "TXT", "\"", "\""},
+		{"A record is untouched", "A", "192.0.2.1", "192.0.2.1"},
+		{"CNAME record is untouched", "CNAME", "target.example.com.", "target.example.com."},
+		{"MX record is untouched", "MX", "10 mail.example.com.", "10 mail.example.com."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeReadTarget(tt.recordType, tt.target))
+		})
+	}
+}
+
+func TestRecordToEndpointNormalizesTargets(t *testing.T) {
+	srv := recordToEndpoint(InfomaniakRecord{Source: "_sip._tcp", Type: "SRV", Target: "10 50 3478 turn.example.com", TTL: 3600}, "example.com")
+	require.NotNil(t, srv)
+	assert.Equal(t, "10 50 3478 turn.example.com.", srv.Targets[0])
+
+	txt := recordToEndpoint(InfomaniakRecord{Source: "_dmarc", Type: "TXT", Target: "\"v=DMARC1; p=quarantine\"", TTL: 3600}, "example.com")
+	require.NotNil(t, txt)
+	assert.Equal(t, "v=DMARC1; p=quarantine", txt.Targets[0])
+}
+
+func TestProviderRecordsNormalizesSRVAndTXT(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/2/domains/domains":
+			require.NoError(t, json.NewEncoder(w).Encode(DomainListResponse{
+				Result: "success",
+				Data:   []InfomaniakDomain{{Name: "example.com"}},
+			}))
+		case "/2/domains/domains/example.com/zones":
+			require.NoError(t, json.NewEncoder(w).Encode(ZoneListResponse{
+				Result: "success",
+				Data:   []InfomaniakZone{{FQDN: "example.com"}},
+			}))
+		case "/2/zones/example.com/records":
+			// The Infomaniak API returns SRV targets without a trailing dot and TXT
+			// values wrapped in literal quotes; Records() must normalize both so the
+			// endpoints match what ExternalDNS holds (otherwise they churn forever).
+			require.NoError(t, json.NewEncoder(w).Encode(RecordListResponse{
+				Result: "success",
+				Data: []InfomaniakRecord{
+					{ID: 1, Source: "_sip._tcp", Type: "SRV", Target: "10 50 3478 turn.example.com", TTL: 3600},
+					{ID: 2, Source: "_dmarc", Type: "TXT", Target: "\"v=DMARC1; p=quarantine\"", TTL: 3600},
+				},
+			}))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	config := &Config{APIToken: "test-token", DryRun: false}
+	client := NewInfomaniakClient(config)
+	client.baseURL = server.URL
+
+	provider := &Provider{client: client, dryRun: false, domainFilter: nil}
+
+	endpoints, err := provider.Records(context.Background())
+
+	require.NoError(t, err)
+	require.Len(t, endpoints, 2)
+
+	byType := map[string]*endpoint.Endpoint{}
+	for _, ep := range endpoints {
+		byType[ep.RecordType] = ep
+	}
+
+	require.Contains(t, byType, "SRV")
+	assert.Equal(t, "10 50 3478 turn.example.com.", byType["SRV"].Targets[0])
+
+	require.Contains(t, byType, "TXT")
+	assert.Equal(t, "v=DMARC1; p=quarantine", byType["TXT"].Targets[0])
+}

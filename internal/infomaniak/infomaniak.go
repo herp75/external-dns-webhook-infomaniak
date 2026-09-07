@@ -135,7 +135,35 @@ func recordToEndpoint(r InfomaniakRecord, zoneFQDN string) *endpoint.Endpoint {
 	dnsName := ensureFQDN(r.Source, zoneFQDN)
 	// Normalize TTL to match what we send to the API
 	ttl := max(r.TTL, minTTL)
-	return endpoint.NewEndpointWithTTL(dnsName, r.Type, endpoint.TTL(ttl), r.Target)
+	target := normalizeReadTarget(r.Type, r.Target)
+
+	return endpoint.NewEndpointWithTTL(dnsName, r.Type, endpoint.TTL(ttl), target)
+}
+
+// normalizeReadTarget reconciles the Infomaniak API's read representation of a
+// target with what ExternalDNS expects, so that records ExternalDNS created do
+// not appear perpetually changed (which otherwise causes an endless update loop):
+//   - SRV: the API returns the target host without a trailing dot, but ExternalDNS
+//     requires one (RFC 2782; see endpoint.NewSRVRecord), so re-add it.
+//   - TXT: the API returns the value wrapped in a pair of literal double quotes,
+//     while ExternalDNS holds the unquoted value, so strip one surrounding pair.
+func normalizeReadTarget(recordType, target string) string {
+	switch recordType {
+	case "SRV":
+		// SRV target is "priority weight port host"; ensure the host ends with a dot.
+		if fields := strings.Fields(target); len(fields) == 4 && !strings.HasSuffix(fields[3], ".") {
+			fields[3] += "."
+
+			return strings.Join(fields, " ")
+		}
+	case "TXT":
+		// Strip a single surrounding pair of double quotes if present.
+		if len(target) >= 2 && strings.HasPrefix(target, `"`) && strings.HasSuffix(target, `"`) {
+			return target[1 : len(target)-1]
+		}
+	}
+
+	return target
 }
 
 // ensureFQDN ensures the record name is a fully qualified domain name.
